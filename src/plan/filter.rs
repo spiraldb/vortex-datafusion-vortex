@@ -30,7 +30,7 @@ use vortex::{
     dtype::{DType, StructFields, arrow::FromArrowType},
     session::VortexSession,
 };
-use vortex_datafusion::{DefaultExpressionConvertor, ExpressionConvertor};
+use vortex_datafusion::convert::{DefaultExpressionConvertor, ExpressionConvertor};
 
 use crate::{array::VortexArray, plan::utils::chunk_to_record_batch};
 

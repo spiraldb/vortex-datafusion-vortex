@@ -33,7 +33,7 @@ use vortex::{
     io::{object_store::ObjectStoreReadAt, session::RuntimeSessionExt},
     session::VortexSession,
 };
-use vortex_datafusion::{DefaultExpressionConvertor, ExpressionConvertor};
+use vortex_datafusion::convert::{DefaultExpressionConvertor, ExpressionConvertor};
 
 use crate::plan::utils::chunk_to_record_batch;
 

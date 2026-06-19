@@ -11,8 +11,8 @@ delegate = "0.13.5"
 futures = "0.3.32"
 futures-util = "0.3.32"
 itertools = "0.15.0"
-vortex = { path = "/Users/adamgs/code/vortex/vortex" }
-vortex-datafusion = { path = "/Users/adamgs/code/vortex/vortex-datafusion" }
+vortex = { git = "http://github.com/vortex-data/vortex.git", branch = "develop" }
+vortex-datafusion = { git = "http://github.com/vortex-data/vortex.git", branch = "develop" }
 
 [dev-dependencies]
 anyhow = "1.0.102"

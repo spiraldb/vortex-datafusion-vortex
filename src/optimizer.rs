@@ -14,7 +14,8 @@ use datafusion::{
     },
 };
 use vortex::{VortexSessionDefault, io::session::RuntimeSessionExt, session::VortexSession};
-use vortex_datafusion::{DefaultExpressionConvertor, ExpressionConvertor, VortexSource};
+use vortex_datafusion::VortexSource;
+use vortex_datafusion::convert::{DefaultExpressionConvertor, ExpressionConvertor};
 
 use crate::plan::{
     aggregate::VortexAggregateExec, export::VortexExportExec, is_vortex_plan, scan::VortexScanExec,
