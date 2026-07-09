@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use datafusion::{
     catalog::memory::DataSourceExec,
     common::tree_node::{Transformed, TreeNode},
@@ -11,6 +12,7 @@ use datafusion::{
         ExecutionPlan,
         aggregates::{AggregateExec, AggregateMode},
         coalesce_partitions::CoalescePartitionsExec,
+        repartition::RepartitionExec,
     },
 };
 use vortex::{VortexSessionDefault, io::session::RuntimeSessionExt, session::VortexSession};
@@ -83,6 +85,20 @@ impl PhysicalOptimizerRule for VortexPlanRule {
             }
 
             if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+                && let Some((input, aggr_expr, input_schema)) =
+                    vortex_input_for_partial_final_aggregate(aggregate)
+            {
+                changed = true;
+                return Ok(Transformed::yes(Arc::new(VortexAggregateExec::try_new(
+                    input,
+                    aggr_expr,
+                    input_schema,
+                    aggregate.schema(),
+                    session.clone(),
+                )?) as _));
+            }
+
+            if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
                 && is_supported_vortex_aggregate(aggregate)
                 && let Some(input) = vortex_input_for_aggregate(aggregate.input())
             {
@@ -150,11 +166,66 @@ fn is_supported_vortex_aggregate(aggregate: &AggregateExec) -> bool {
         && aggregate.aggr_expr().iter().all(is_supported_sum_aggregate)
 }
 
+fn vortex_input_for_partial_final_aggregate(
+    aggregate: &AggregateExec,
+) -> Option<(
+    Arc<dyn ExecutionPlan>,
+    Vec<Arc<AggregateFunctionExpr>>,
+    SchemaRef,
+)> {
+    if !is_supported_vortex_final_aggregate(aggregate) {
+        return None;
+    }
+
+    let partial = partial_aggregate_input(aggregate.input())?;
+    if !is_supported_vortex_partial_aggregate(partial) {
+        return None;
+    }
+
+    let input = vortex_raw_aggregate_input(partial.input())?;
+    Some((input, partial.aggr_expr().to_vec(), partial.input_schema()))
+}
+
+fn vortex_raw_aggregate_input(input: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    let input = if let Some(repartition) = input.downcast_ref::<RepartitionExec>() {
+        repartition.input()
+    } else {
+        input
+    };
+
+    unwrap_vortex_export(input).filter(is_vortex_native_plan)
+}
+
+fn partial_aggregate_input(input: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
+    if let Some(coalesce) = input.downcast_ref::<CoalescePartitionsExec>() {
+        return coalesce.input().downcast_ref::<AggregateExec>();
+    }
+
+    input.downcast_ref::<AggregateExec>()
+}
+
+fn is_supported_vortex_final_aggregate(aggregate: &AggregateExec) -> bool {
+    matches!(aggregate.mode(), AggregateMode::Final)
+        && aggregate.group_expr().is_true_no_grouping()
+        && aggregate.filter_expr().iter().all(Option::is_none)
+        && aggregate.aggr_expr().iter().all(is_sum_aggregate_function)
+}
+
+fn is_supported_vortex_partial_aggregate(aggregate: &AggregateExec) -> bool {
+    matches!(aggregate.mode(), AggregateMode::Partial)
+        && aggregate.group_expr().is_true_no_grouping()
+        && aggregate.filter_expr().iter().all(Option::is_none)
+        && aggregate.aggr_expr().iter().all(is_supported_sum_aggregate)
+}
+
+fn is_sum_aggregate_function(aggregate: &Arc<AggregateFunctionExpr>) -> bool {
+    aggregate.fun().name().eq_ignore_ascii_case("sum")
+        && !aggregate.is_distinct()
+        && aggregate.order_bys().is_empty()
+}
+
 fn is_supported_sum_aggregate(aggregate: &Arc<AggregateFunctionExpr>) -> bool {
-    if !aggregate.fun().name().eq_ignore_ascii_case("sum")
-        || aggregate.is_distinct()
-        || !aggregate.order_bys().is_empty()
-    {
+    if !is_sum_aggregate_function(aggregate) {
         return false;
     }
 
@@ -184,4 +255,71 @@ fn unwrap_vortex_export(input: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Execut
 
 fn is_vortex_native_plan(plan: &Arc<dyn ExecutionPlan>) -> bool {
     is_vortex_plan(plan) && !plan.is::<VortexExportExec>()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::{
+        datasource::provider::DefaultTableFactory,
+        execution::SessionStateBuilder,
+        physical_plan::{ExecutionPlan, displayable},
+        prelude::{SessionConfig, SessionContext},
+    };
+    use vortex_datafusion::VortexFormatFactory;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn rewrites_partial_final_sum_over_vortex_scan() -> anyhow::Result<()> {
+        let vortex_format = Arc::new(VortexFormatFactory::new());
+        let mut state = SessionStateBuilder::new_with_default_features()
+            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_table_factory("VORTEX".to_string(), Arc::new(DefaultTableFactory::new()))
+            .with_physical_optimizer_rule(Arc::new(VortexPlanRule::new()))
+            .build();
+
+        state.register_file_format(vortex_format, false)?;
+        let ctx = SessionContext::new_with_state(state);
+
+        let dir = tempfile::tempdir()?;
+        let location = format!("file://{}/", dir.path().display());
+        ctx.sql(&format!(
+            "CREATE EXTERNAL TABLE events (id BIGINT) \
+             STORED AS vortex LOCATION '{location}'"
+        ))
+        .await?
+        .collect()
+        .await?;
+
+        for id in 1..=4 {
+            ctx.sql(&format!("INSERT INTO events VALUES ({id})"))
+                .await?
+                .collect()
+                .await?;
+        }
+
+        let plan = ctx
+            .sql("SELECT SUM(id) AS total FROM events")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let plan_display = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(
+            contains_node::<VortexAggregateExec>(&plan),
+            "expected VortexAggregateExec in plan:\n{plan_display}"
+        );
+        assert!(
+            !contains_node::<AggregateExec>(&plan),
+            "expected DataFusion AggregateExec chain to be replaced:\n{plan_display}"
+        );
+
+        Ok(())
+    }
+
+    fn contains_node<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        plan.is::<T>() || plan.children().into_iter().any(contains_node::<T>)
+    }
 }
